@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -22,7 +23,7 @@ import (
 
 // 'make build' will overwrite this string with the output of git-describe (tag)
 var (
-	Version         = "v0.0.0.0-dev"
+	Version         = "v1.0.0-bitcoinz"
 	GitCommit       = ""
 	Branch          = ""
 	BuildDate       = ""
@@ -53,6 +54,13 @@ type Options struct {
 	PingEnable          bool   `json:"ping_enable"`
 	Darkside            bool   `json:"darkside"`
 	DarksideTimeout     uint64 `json:"darkside_timeout"`
+
+	// Performance tuning
+	BlockPollInterval    time.Duration `json:"block_poll_interval"`
+	MempoolPollInterval  time.Duration `json:"mempool_poll_interval"`
+	Workers              int           `json:"workers"`
+	MaxBlockRange        int           `json:"max_block_range"`
+	MaxConcurrentStreams  uint32        `json:"max_concurrent_streams"`
 }
 
 // RawRequest points to the function to send an RPC request to bitcoinzd;
@@ -403,11 +411,68 @@ func stopIngestor() {
 	}
 }
 
+// IngestorConfig holds configurable parameters for block ingestion.
+// Set by cmd/root.go from CLI flags before starting the ingestor.
+var IngestorConfig struct {
+	BlockPollInterval time.Duration
+	Workers           int
+}
+
+func init() {
+	// Defaults (overridden by CLI flags)
+	IngestorConfig.BlockPollInterval = 1 * time.Second
+	IngestorConfig.Workers = 4
+}
+
+// prefetchBlocks fetches multiple blocks in parallel using a worker pool.
+// Results are placed into the results slice at the correct index.
+// Returns the number of successfully fetched blocks (contiguous from index 0).
+func prefetchBlocks(startHeight, count, workers int) ([]*walletrpc.CompactBlock, int) {
+	results := make([]*walletrpc.CompactBlock, count)
+	errs := make([]error, count)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			block, err := getBlockFromRPC(startHeight + idx)
+			if err != nil {
+				errs[idx] = err
+			} else {
+				results[idx] = block
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Find contiguous successful results from index 0
+	good := 0
+	for i := 0; i < count; i++ {
+		if results[i] == nil || errs[i] != nil {
+			break
+		}
+		good++
+	}
+	return results, good
+}
+
 // BlockIngestor runs as a goroutine and polls bitcoinzd for new blocks, adding them
 // to the cache. The repetition count, rep, is nonzero only for unit-testing.
 func BlockIngestor(c *BlockCache, rep int) {
 	lastLog := Time.Now()
 	lastHeightLogged := 0
+	pollInterval := IngestorConfig.BlockPollInterval
+	workers := IngestorConfig.Workers
+	if workers < 1 {
+		workers = 1
+	}
+
+	const prefetchBatch = 16 // blocks to prefetch at once
+	const nearTipThreshold = 10
 
 	// Start listening for new blocks
 	for i := 0; rep == 0 || i < rep; i++ {
@@ -442,10 +507,55 @@ func BlockIngestor(c *BlockCache, rep int) {
 				lastHeightLogged = height - 1
 				Log.Info("Waiting for block: ", height)
 			}
-			Time.Sleep(2 * time.Second)
+			Time.Sleep(pollInterval)
 			lastLog = Time.Now()
 			continue
 		}
+
+		// Determine how far behind we are by checking blockchain info
+		chainInfo, chainErr := GetBlockChainInfo()
+		behindBy := 0
+		if chainErr == nil {
+			behindBy = chainInfo.Blocks - height + 1
+		}
+
+		// Use parallel prefetch when catching up (far from tip)
+		if behindBy > nearTipThreshold && workers > 1 {
+			batchSize := prefetchBatch
+			if batchSize > behindBy {
+				batchSize = behindBy
+			}
+
+			blocks, good := prefetchBlocks(height, batchSize, workers)
+			if good == 0 {
+				Log.Info("prefetch at height ", height, " returned no blocks, falling back to single fetch")
+				Time.Sleep(8 * time.Second)
+				continue
+			}
+
+			added := 0
+			for j := 0; j < good; j++ {
+				block := blocks[j]
+				if block != nil && c.HashMatch(block.PrevHash) {
+					if err = c.Add(height+j, block); err != nil {
+						Log.Fatal("Cache add failed:", err)
+					}
+					added++
+					if DarksideEnabled || Time.Now().Sub(lastLog).Seconds() >= 4 {
+						lastLog = Time.Now()
+						Log.Info("Adding block to cache ", height+j, " ", displayHash(block.Hash))
+					}
+				} else {
+					break
+				}
+			}
+			if added > 0 {
+				continue
+			}
+			// If no blocks could be added (hash mismatch), fall through to reorg handling
+		}
+
+		// Single block fetch (near tip or fallback)
 		var block *walletrpc.CompactBlock
 		block, err = getBlockFromRPC(height)
 		if err != nil {
@@ -503,6 +613,10 @@ func GetBlock(cache *BlockCache, height int) (*walletrpc.CompactBlock, error) {
 	}
 	return block, nil
 }
+
+// MaxBlockRange is the maximum number of blocks that can be requested in a single
+// GetBlockRange call. Set via CLI flag --max-block-range.
+var MaxBlockRange = 10000
 
 // GetBlockRange returns a sequence of consecutive blocks in the given range.
 func GetBlockRange(cache *BlockCache, blockOut chan<- *walletrpc.CompactBlock, errOut chan<- error, start, end int) {

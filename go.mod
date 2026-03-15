@@ -14,6 +14,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/viper v1.18.2
+	golang.org/x/time v0.5.0
 	google.golang.org/grpc v1.61.0
 	google.golang.org/protobuf v1.33.0
 	gopkg.in/ini.v1 v1.67.0

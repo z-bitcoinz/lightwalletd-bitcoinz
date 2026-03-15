@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,13 +15,16 @@ import (
 	"github.com/btcsuite/btcd/rpcclient"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/stats"
 
 	"github.com/bitcoinz-xyz/lightwalletd/common"
 	"github.com/bitcoinz-xyz/lightwalletd/common/logging"
@@ -60,6 +64,11 @@ var rootCmd = &cobra.Command{
 			PingEnable:          viper.GetBool("ping-very-insecure"),
 			Darkside:            viper.GetBool("darkside-very-insecure"),
 			DarksideTimeout:     viper.GetUint64("darkside-timeout"),
+			BlockPollInterval:   viper.GetDuration("block-poll-interval"),
+			MempoolPollInterval: viper.GetDuration("mempool-poll-interval"),
+			Workers:             viper.GetInt("workers"),
+			MaxBlockRange:       viper.GetInt("max-block-range"),
+			MaxConcurrentStreams: uint32(viper.GetInt("max-concurrent-streams")),
 		}
 
 		common.Log.Debugf("Options: %#v\n", opts)
@@ -102,6 +111,35 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
+// activeConnections tracks the number of active gRPC connections.
+var activeConnections = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "grpc_active_connections",
+	Help: "Number of active gRPC connections",
+})
+
+func init() {
+	prometheus.MustRegister(activeConnections)
+}
+
+// connStatsHandler tracks gRPC connection lifecycle for Prometheus metrics.
+type connStatsHandler struct{}
+
+func (h *connStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+func (h *connStatsHandler) HandleRPC(ctx context.Context, s stats.RPCStats) {}
+func (h *connStatsHandler) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+func (h *connStatsHandler) HandleConn(ctx context.Context, s stats.ConnStats) {
+	switch s.(type) {
+	case *stats.ConnBegin:
+		activeConnections.Inc()
+	case *stats.ConnEnd:
+		activeConnections.Dec()
+	}
+}
+
 func startServer(opts *common.Options) error {
 	if opts.LogFile != "" {
 		// instead write parsable logs for logstash/splunk/etc
@@ -121,11 +159,59 @@ func startServer(opts *common.Options) error {
 
 	logging.LogToStderr = opts.GRPCLogging
 
+	// Apply configurable parameters to global settings
+	common.IngestorConfig.BlockPollInterval = opts.BlockPollInterval
+	common.IngestorConfig.Workers = opts.Workers
+	common.MempoolPollInterval = opts.MempoolPollInterval
+	common.MaxBlockRange = opts.MaxBlockRange
+
 	common.Log.WithFields(logrus.Fields{
 		"gitCommit": common.GitCommit,
 		"buildDate": common.BuildDate,
 		"buildUser": common.BuildUser,
 	}).Infof("Starting lightwalletd process version %s", common.Version)
+
+	// Rate limiter for abuse protection
+	rateLimiter := common.NewRateLimiter()
+
+	// Shared gRPC server options for performance and protection
+	serverOpts := []grpc.ServerOption{
+		// Abuse protection: limit concurrent streams per connection
+		grpc.MaxConcurrentStreams(opts.MaxConcurrentStreams),
+
+		// Performance: allow larger messages (16MB) for big block ranges
+		grpc.MaxRecvMsgSize(16 * 1024 * 1024),
+		grpc.MaxSendMsgSize(16 * 1024 * 1024),
+
+		// Keepalive: detect dead connections, free resources
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle:     5 * time.Minute,
+			MaxConnectionAge:      30 * time.Minute,
+			MaxConnectionAgeGrace: 10 * time.Second,
+			Time:                  1 * time.Minute,
+			Timeout:               20 * time.Second,
+		}),
+
+		// Abuse protection: enforce client keepalive behavior
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             30 * time.Second,
+			PermitWithoutStream: false,
+		}),
+
+		// Connection tracking for metrics
+		grpc.StatsHandler(&connStatsHandler{}),
+
+		// Interceptor chains (with rate limiter)
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			rateLimiter.StreamInterceptor,
+			grpc_prometheus.StreamServerInterceptor,
+		)),
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			rateLimiter.UnaryInterceptor,
+			logging.LogInterceptor,
+			grpc_prometheus.UnaryServerInterceptor,
+		)),
+	}
 
 	// gRPC initialization
 	var server *grpc.Server
@@ -133,15 +219,7 @@ func startServer(opts *common.Options) error {
 	if opts.NoTLSVeryInsecure {
 		common.Log.Warningln("Starting insecure no-TLS (plaintext) server")
 		fmt.Println("Starting insecure server")
-		server = grpc.NewServer(
-			grpc.StreamInterceptor(
-				grpc_middleware.ChainStreamServer(
-					grpc_prometheus.StreamServerInterceptor),
-			),
-			grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-				logging.LogInterceptor,
-				grpc_prometheus.UnaryServerInterceptor),
-			))
+		server = grpc.NewServer(serverOpts...)
 	} else {
 		var transportCreds credentials.TransportCredentials
 		if opts.GenCertVeryInsecure {
@@ -160,15 +238,7 @@ func startServer(opts *common.Options) error {
 				}).Fatal("couldn't load TLS credentials")
 			}
 		}
-		server = grpc.NewServer(
-			grpc.Creds(transportCreds),
-			grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-				grpc_prometheus.StreamServerInterceptor),
-			),
-			grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-				logging.LogInterceptor,
-				grpc_prometheus.UnaryServerInterceptor),
-			))
+		server = grpc.NewServer(append(serverOpts, grpc.Creds(transportCreds))...)
 	}
 	grpc_prometheus.EnableHandlingTimeHistogram()
 	grpc_prometheus.Register(server)
@@ -353,6 +423,11 @@ func init() {
 	rootCmd.Flags().Bool("darkside-very-insecure", false, "run with GRPC-controllable mock zebrad for integration testing (shuts down after 30 minutes)")
 	rootCmd.Flags().Int("darkside-timeout", 30, "override 30 minute default darkside timeout")
 	rootCmd.Flags().String("donation-address", "", "BitcoinZ UA address to accept donations for operating this server")
+	rootCmd.Flags().Duration("block-poll-interval", 1*time.Second, "how often to check for new blocks when synced")
+	rootCmd.Flags().Duration("mempool-poll-interval", 2*time.Second, "how often to refresh mempool")
+	rootCmd.Flags().Int("workers", 4, "number of parallel block fetch workers during sync")
+	rootCmd.Flags().Int("max-block-range", 10000, "max blocks per GetBlockRange request")
+	rootCmd.Flags().Int("max-concurrent-streams", 100, "max gRPC concurrent streams per connection")
 
 	viper.BindPFlag("grpc-bind-addr", rootCmd.Flags().Lookup("grpc-bind-addr"))
 	viper.SetDefault("grpc-bind-addr", "127.0.0.1:9067")
@@ -393,6 +468,16 @@ func init() {
 	viper.BindPFlag("darkside-timeout", rootCmd.Flags().Lookup("darkside-timeout"))
 	viper.SetDefault("darkside-timeout", 30)
 	viper.BindPFlag("donation-address", rootCmd.Flags().Lookup("donation-address"))
+	viper.BindPFlag("block-poll-interval", rootCmd.Flags().Lookup("block-poll-interval"))
+	viper.SetDefault("block-poll-interval", 1*time.Second)
+	viper.BindPFlag("mempool-poll-interval", rootCmd.Flags().Lookup("mempool-poll-interval"))
+	viper.SetDefault("mempool-poll-interval", 2*time.Second)
+	viper.BindPFlag("workers", rootCmd.Flags().Lookup("workers"))
+	viper.SetDefault("workers", 4)
+	viper.BindPFlag("max-block-range", rootCmd.Flags().Lookup("max-block-range"))
+	viper.SetDefault("max-block-range", 10000)
+	viper.BindPFlag("max-concurrent-streams", rootCmd.Flags().Lookup("max-concurrent-streams"))
+	viper.SetDefault("max-concurrent-streams", 100)
 
 	logger.SetFormatter(&logrus.TextFormatter{
 		//DisableColors:          true,

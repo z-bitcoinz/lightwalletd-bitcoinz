@@ -10,6 +10,10 @@ import (
 
 type txid string
 
+// MempoolPollInterval controls how often mempool is refreshed.
+// Set by cmd/root.go from CLI flags.
+var MempoolPollInterval = 2 * time.Second
+
 var (
 	// Set of mempool txids that have been seen during the current block interval.
 	// The zcashd RPC `getrawmempool` returns the entire mempool each time, so
@@ -42,9 +46,8 @@ func GetMempool(sendToClient func(*walletrpc.RawTransaction) error) error {
 
 	// Wait for more transactions to be added to the list
 	for {
-		// Don't fetch the mempool more often than every 2 seconds.
 		now := Time.Now()
-		if now.After(g_lastTime.Add(2 * time.Second)) {
+		if now.After(g_lastTime.Add(MempoolPollInterval)) {
 			blockChainInfo, err := GetBlockChainInfo()
 			if err != nil {
 				g_lock.Unlock()
@@ -85,7 +88,15 @@ func GetMempool(sendToClient func(*walletrpc.RawTransaction) error) error {
 	return nil
 }
 
-// RefreshMempoolTxns gets all new mempool txns and sends any new ones to waiting clients
+// fetchResult holds the result of a parallel mempool transaction fetch.
+type fetchResult struct {
+	txidStr string
+	rawtx   *walletrpc.RawTransaction
+	err     error
+}
+
+// refreshMempoolTxns gets all new mempool txns and sends any new ones to waiting clients.
+// Uses a small worker pool to fetch transactions in parallel.
 func refreshMempoolTxns() error {
 	params := []json.RawMessage{}
 	result, rpcErr := RawRequest("getrawmempool", params)
@@ -98,39 +109,70 @@ func refreshMempoolTxns() error {
 		return err
 	}
 
-	// Fetch all new mempool txns and add them into `newTxns`
+	// Collect new txids to fetch
+	var newTxids []string
 	for _, txidstr := range mempoolList {
 		if _, ok := g_txidSeen[txid(txidstr)]; ok {
-			// We've already fetched this transaction
 			continue
 		}
-
-		// We haven't fetched this transaction already.
 		g_txidSeen[txid(txidstr)] = struct{}{}
-		txidJSON, err := json.Marshal(txidstr)
-		if err != nil {
-			return err
-		}
+		newTxids = append(newTxids, txidstr)
+	}
 
-		params := []json.RawMessage{txidJSON, json.RawMessage("1")}
-		result, rpcErr := RawRequest("getrawtransaction", params)
-		if rpcErr != nil {
-			// Not an error; mempool transactions can disappear
+	if len(newTxids) == 0 {
+		return nil
+	}
+
+	// Fetch new transactions in parallel with a small worker pool
+	const mempoolWorkers = 3
+	resultChan := make(chan fetchResult, len(newTxids))
+	sem := make(chan struct{}, mempoolWorkers)
+	var wg sync.WaitGroup
+
+	for _, txidstr := range newTxids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(tid string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			txidJSON, err := json.Marshal(tid)
+			if err != nil {
+				resultChan <- fetchResult{txidStr: tid, err: err}
+				return
+			}
+			params := []json.RawMessage{txidJSON, json.RawMessage("1")}
+			result, rpcErr := RawRequest("getrawtransaction", params)
+			if rpcErr != nil {
+				// Not an error; mempool transactions can disappear
+				resultChan <- fetchResult{txidStr: tid}
+				return
+			}
+			rawtx, err := ParseRawTransaction(result)
+			if err != nil {
+				resultChan <- fetchResult{txidStr: tid, err: err}
+				return
+			}
+			resultChan <- fetchResult{txidStr: tid, rawtx: rawtx}
+		}(txidstr)
+	}
+	wg.Wait()
+	close(resultChan)
+
+	// Process results in order they come in (mempool order doesn't matter much)
+	for res := range resultChan {
+		if res.err != nil {
+			return res.err
+		}
+		if res.rawtx == nil {
 			continue
 		}
-
-		rawtx, err := ParseRawTransaction(result)
-		if err != nil {
-			return err
-		}
-
 		// Skip any transaction that has been mined since the list of txids
 		// was retrieved.
-		if (rawtx.Height != 0) {
-			continue;
+		if res.rawtx.Height != 0 {
+			continue
 		}
-
-		g_txList = append(g_txList, rawtx)
+		g_txList = append(g_txList, res.rawtx)
 	}
 	return nil
 }

@@ -225,11 +225,19 @@ func (s *lwdStreamer) GetBlockNullifiers(ctx context.Context, id *walletrpc.Bloc
 // 'end' inclusively.
 func (s *lwdStreamer) GetBlockRange(span *walletrpc.BlockRange, resp walletrpc.CompactTxStreamer_GetBlockRangeServer) error {
 	common.Log.Debugf("gRPC GetBlockRange(%+v)\n", span)
-	blockChan := make(chan *walletrpc.CompactBlock)
 	if span.Start == nil || span.End == nil {
 		return status.Error(codes.InvalidArgument,
 			"GetBlockRange: must specify start and end heights")
 	}
+	rangeSize := int(span.End.Height) - int(span.Start.Height)
+	if rangeSize < 0 {
+		rangeSize = -rangeSize
+	}
+	if rangeSize > common.MaxBlockRange {
+		return status.Errorf(codes.InvalidArgument,
+			"GetBlockRange: requested %d blocks, max is %d", rangeSize, common.MaxBlockRange)
+	}
+	blockChan := make(chan *walletrpc.CompactBlock, 32)
 	errChan := make(chan error)
 	go common.GetBlockRange(s.cache, blockChan, errChan, int(span.Start.Height), int(span.End.Height))
 
@@ -251,11 +259,19 @@ func (s *lwdStreamer) GetBlockRange(span *walletrpc.BlockRange, resp walletrpc.C
 // the actions contain only nullifiers (a subset of the full compact block).
 func (s *lwdStreamer) GetBlockRangeNullifiers(span *walletrpc.BlockRange, resp walletrpc.CompactTxStreamer_GetBlockRangeNullifiersServer) error {
 	common.Log.Debugf("gRPC GetBlockRangeNullifiers(%+v)\n", span)
-	blockChan := make(chan *walletrpc.CompactBlock)
 	if span.Start == nil || span.End == nil {
 		return status.Error(codes.InvalidArgument,
 			"GetBlockRangeNullifiers: must specify start and end heights")
 	}
+	rangeSize := int(span.End.Height) - int(span.Start.Height)
+	if rangeSize < 0 {
+		rangeSize = -rangeSize
+	}
+	if rangeSize > common.MaxBlockRange {
+		return status.Errorf(codes.InvalidArgument,
+			"GetBlockRangeNullifiers: requested %d blocks, max is %d", rangeSize, common.MaxBlockRange)
+	}
+	blockChan := make(chan *walletrpc.CompactBlock, 32)
 	errChan := make(chan error)
 	go common.GetBlockRange(s.cache, blockChan, errChan, int(span.Start.Height), int(span.End.Height))
 
