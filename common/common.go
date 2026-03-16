@@ -23,7 +23,7 @@ import (
 
 // 'make build' will overwrite this string with the output of git-describe (tag)
 var (
-	Version         = "v1.0.0-bitcoinz"
+	Version         = "v2.0.0-bitcoinz-turbo"
 	GitCommit       = ""
 	Branch          = ""
 	BuildDate       = ""
