@@ -43,6 +43,20 @@ var (
 	g_lock sync.Mutex
 )
 
+// InjectTransaction adds a locally-submitted transaction directly into the
+// mempool tracker so that connected GetMempoolStream clients see it immediately,
+// without waiting for the next getrawmempool poll cycle.
+func InjectTransaction(txidStr string, rawtx *walletrpc.RawTransaction) {
+	g_lock.Lock()
+	defer g_lock.Unlock()
+	if _, ok := g_txidSeen[txid(txidStr)]; ok {
+		return // already tracked
+	}
+	g_txidSeen[txid(txidStr)] = struct{}{}
+	g_txList = append(g_txList, rawtx)
+	Log.Debugf("Injected tx %s into mempool tracker for immediate streaming\n", txidStr)
+}
+
 func GetMempool(ctx context.Context, sendToClient func(*walletrpc.RawTransaction) error) error {
 	g_lock.Lock()
 	index := 0
