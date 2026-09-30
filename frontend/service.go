@@ -479,6 +479,16 @@ func (s *lwdStreamer) SendTransaction(ctx context.Context, rawtx *walletrpc.RawT
 	} else {
 		// Return the transaction ID (txid) as hex string.
 		errMsg = string(result)
+
+		// Inject into mempool tracker so GetMempoolStream clients see it
+		// immediately, without waiting for the next getrawmempool poll.
+		var txidStr string
+		if json.Unmarshal(result, &txidStr) == nil {
+			common.InjectTransaction(txidStr, &walletrpc.RawTransaction{
+				Data:   rawtx.Data,
+				Height: 0,
+			})
+		}
 	}
 
 	// TODO these are called Error but they aren't at the moment.
