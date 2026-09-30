@@ -547,7 +547,7 @@ func (s *lwdStreamer) GetTaddressBalanceStream(addresses walletrpc.CompactTxStre
 
 func (s *lwdStreamer) GetMempoolStream(_empty *walletrpc.Empty, resp walletrpc.CompactTxStreamer_GetMempoolStreamServer) error {
 	common.Log.Debugf("gRPC GetMempoolStream()\n")
-	err := common.GetMempool(func(tx *walletrpc.RawTransaction) error {
+	err := common.GetMempool(resp.Context(), func(tx *walletrpc.RawTransaction) error {
 		return resp.Send(tx)
 	})
 	return err

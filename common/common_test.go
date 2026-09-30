@@ -6,6 +6,7 @@ package common
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -671,7 +672,7 @@ func TestMempoolStream(t *testing.T) {
 
 	var replies []*walletrpc.RawTransaction
 	// The first request after startup immediately returns an empty list.
-	err := GetMempool(func(tx *walletrpc.RawTransaction) error {
+	err := GetMempool(context.Background(), func(tx *walletrpc.RawTransaction) error {
 		t.Fatal("send to client function called on initial GetMempool call")
 		return nil
 	})
@@ -680,7 +681,7 @@ func TestMempoolStream(t *testing.T) {
 	}
 
 	// This should return two transactions.
-	err = GetMempool(func(tx *walletrpc.RawTransaction) error {
+	err = GetMempool(context.Background(), func(tx *walletrpc.RawTransaction) error {
 		replies = append(replies, tx)
 		return nil
 	})

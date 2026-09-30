@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"time"
@@ -9,6 +10,14 @@ import (
 )
 
 type txid string
+
+// MempoolHeartbeatInterval: if nothing has been sent to a GetMempoolStream
+// client for this long, send it an empty RawTransaction. Clients give up on a
+// silent stream (the Z-Text wallet after 120s, Cloudflare's proxy after 125s)
+// and BTCZ blocks are ~155s apart, so without this the stream is often cut
+// before the new block that is supposed to close it. Clients skip the empty
+// message because its data does not parse as a transaction. Zero disables it.
+var MempoolHeartbeatInterval = 60 * time.Second
 
 var (
 	// Set of mempool txids that have been seen during the current block interval.
@@ -34,9 +43,10 @@ var (
 	g_lock sync.Mutex
 )
 
-func GetMempool(sendToClient func(*walletrpc.RawTransaction) error) error {
+func GetMempool(ctx context.Context, sendToClient func(*walletrpc.RawTransaction) error) error {
 	g_lock.Lock()
 	index := 0
+	lastSent := Time.Now()
 	// Stay in this function until the tip block hash changes.
 	stayHash := g_lastBlockChainInfo.BestBlockHash
 
@@ -74,6 +84,18 @@ func GetMempool(sendToClient func(*walletrpc.RawTransaction) error) error {
 			if err := sendToClient(tx); err != nil {
 				return err
 			}
+		}
+		if len(toSend) > 0 {
+			lastSent = Time.Now()
+		} else if MempoolHeartbeatInterval > 0 && Time.Now().Sub(lastSent) >= MempoolHeartbeatInterval {
+			if err := sendToClient(&walletrpc.RawTransaction{}); err != nil {
+				return err
+			}
+			lastSent = Time.Now()
+		}
+		// The client went away: stop now instead of polling until the next block.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		Time.Sleep(200 * time.Millisecond)
 		g_lock.Lock()
